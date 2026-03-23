@@ -134,6 +134,10 @@ class Extractor(PreTrainedModel):
         self._lora_layers = {}
         self._adapter_config = None
 
+        # Hard negative mining state
+        self._hard_neg_enabled = False
+        self._hard_neg_masking_rate = 0.5
+
         self._print_config(config)
 
     def _print_config(self, config):
@@ -144,6 +148,38 @@ class Extractor(PreTrainedModel):
         print(f"Counting layer     : {config.counting_layer}")
         print(f"Token pooling      : {config.token_pooling}")
         print("=" * 60)
+
+    # =========================================================================
+    # Hard Negative Mining
+    # =========================================================================
+
+    def configure_hard_neg(self, enabled: bool = True, masking_rate: float = 0.5):
+        """
+        Configure hard negative mining for structure loss.
+
+        Instead of randomly masking negatives, masking probability is based on
+        model confidence: easy negatives (low score) are masked more often,
+        hard negatives (high score, i.e. near false positives) are kept more often.
+
+        This focuses training on the model's mistakes, improving training signal
+        quality. Well-established technique in metric learning and object detection.
+
+        References:
+            - Schroff et al. (2015) "FaceNet: A Unified Embedding for Face
+              Recognition and Clustering"
+            - Shrivastava et al. (2016) "Training Region-Based Object Detectors
+              with Online Hard Example Mining"
+
+        Args:
+            enabled: Whether to use confidence-based negative masking.
+            masking_rate: Base masking rate — controls what fraction of negatives
+                are masked on average (same semantics as upstream default 0.5).
+                The actual per-element masking probability is modulated by
+                the model's confidence: easy negatives are masked more,
+                hard negatives are masked less.
+        """
+        self._hard_neg_enabled = enabled
+        self._hard_neg_masking_rate = masking_rate
 
     # =========================================================================
     # Main Forward Pass
@@ -568,11 +604,41 @@ class Extractor(PreTrainedModel):
                             labs[i, k, start, width] = 1
 
         # Apply negative masking
-        if masking_rate > 0.0 and self.training:
+        effective_masking_rate = (
+            self._hard_neg_masking_rate if self._hard_neg_enabled else masking_rate
+        )
+        if effective_masking_rate > 0.0 and self.training:
             negative = (labs == 0)
-            random_mask = torch.rand_like(scores) < masking_rate
-            to_mask = negative & random_mask
-            loss_mask = (~to_mask).float()
+            if self._hard_neg_enabled:
+                # Confidence-based masking: keep hard negatives (high score),
+                # drop easy ones (low score)
+                with torch.no_grad():
+                    neg_probs = torch.sigmoid(scores.detach())
+                    neg_vals = neg_probs * negative.float()
+                    max_val = neg_vals.max()
+                    if max_val > 0:
+                        keep_prob = neg_vals / max_val
+                    else:
+                        keep_prob = torch.zeros_like(scores)
+                    # Rescale so average keep rate matches (1 - masking_rate)
+                    target_keep = 1 - effective_masking_rate
+                    neg_mean = (
+                        keep_prob[negative].mean()
+                        if negative.any()
+                        else torch.tensor(1.0)
+                    )
+                    if neg_mean > 0:
+                        keep_prob = keep_prob * (target_keep / neg_mean)
+                    keep_prob = keep_prob.clamp(0, 1)
+                    # Positives always kept
+                    keep_prob = keep_prob + (1 - negative.float())
+                    keep_prob = keep_prob.clamp(0, 1)
+                loss_mask = (torch.rand_like(scores) < keep_prob).float()
+            else:
+                # Original random masking
+                random_mask = torch.rand_like(scores) < masking_rate
+                to_mask = negative & random_mask
+                loss_mask = (~to_mask).float()
         else:
             loss_mask = torch.ones_like(scores)
 

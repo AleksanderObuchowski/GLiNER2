@@ -219,6 +219,15 @@ class TrainingConfig:
     max_eval_samples: int = -1
     validate_data: bool = True
 
+    # Hard Negative Mining
+    # By default GLiNER2 randomly masks 50% of negative spans in compute_struct_loss.
+    # With hard negative mining, masking probability is proportional to model
+    # confidence: easy negatives (low score) are masked more aggressively, hard
+    # negatives (high score = near false positives) are kept. This focuses training
+    # on the model's mistakes, improving training signal quality.
+    use_hard_negative_mining: bool = False
+    hard_neg_masking_rate: float = 0.5  # Average fraction of negatives masked
+
     # LoRA Configuration (Parameter-Efficient Fine-Tuning)
     use_lora: bool = False
     lora_r: int = 16
@@ -542,6 +551,16 @@ class GLiNER2Trainer:
         self.scaler = None
         self.wandb_run = None
         self.progress_bar = None
+
+        # Configure hard negative mining if enabled
+        if config.use_hard_negative_mining and hasattr(model, 'configure_hard_neg'):
+            model.configure_hard_neg(
+                enabled=True,
+                masking_rate=config.hard_neg_masking_rate,
+            )
+            logger.info(
+                f"Hard negative mining enabled (masking_rate={config.hard_neg_masking_rate})"
+            )
         
         # LoRA state
         self.lora_layers = {}
